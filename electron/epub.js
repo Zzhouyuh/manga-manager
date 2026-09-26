@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const AdmZip = require('adm-zip');
+const { getZip } = require('./zipcache');
 
 const IMAGE_EXT = /\.(jpe?g|png|webp|gif|bmp)$/i;
 
@@ -24,7 +24,8 @@ function parseEpub(epubPath) {
                 return resolve({ success: false, error: '文件不存在: ' + epubPath });
             }
 
-            const zip = new AdmZip(epubPath);
+            const zip = getZip(epubPath);
+            if (!zip) return resolve({ success: false, error: '文件不存在: ' + epubPath });
             const entries = zip.getEntries();
 
             console.log('[epub] 总条目数:', entries.length);
@@ -70,7 +71,8 @@ function parseEpub(epubPath) {
 function extractEpubImage(epubPath, imageHref) {
     return new Promise((resolve) => {
         try {
-            const zip = new AdmZip(epubPath);
+            const zip = getZip(epubPath);
+            if (!zip) return resolve({ success: false, error: '文件不存在: ' + epubPath });
             const entry = zip.getEntry(imageHref);
             if (!entry) {
                 return resolve({ success: false, error: '图片不存在: ' + imageHref });

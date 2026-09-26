@@ -8,13 +8,14 @@ type Props = {
     onClick: (series: Series) => void;
     onDelete?: (series: Series) => void;
     onToggleFavorite?: (series: Series) => void;   // ⭐ 新增
+    onOpenDetail?: (series: Series) => void;       // ⭐ 直接打开详情页（章节/标签）
 };
 
 export default function SeriesCard({
-                                       series, coverMode, onClick, onDelete, onToggleFavorite,
+                                       series, coverMode, onClick, onDelete, onToggleFavorite, onOpenDetail,
                                    }: Props) {
-    const [cover, setCover] = useState<string | null>(null);
-    const [loading, setLoading] = useState(true);
+    // ⭐ 封面走 manga:// 协议，浏览器直接加载并自带缓存
+    const [coverFailed, setCoverFailed] = useState(false);
     const [hover, setHover] = useState(false);
     const [isFav, setIsFav] = useState(series.is_favorite === 1);
 
@@ -23,20 +24,12 @@ export default function SeriesCard({
         setIsFav(series.is_favorite === 1);
     }, [series.is_favorite]);
 
+    // 换封面模式/换书时重置失败标记
     useEffect(() => {
-        let cancelled = false;
-        (async () => {
-            try {
-                const data = await (window as any).api.getSeriesCover(series.id, coverMode);
-                if (!cancelled) setCover(data);
-            } catch (e) {
-                console.warn('加载封面失败:', e);
-            } finally {
-                if (!cancelled) setLoading(false);
-            }
-        })();
-        return () => { cancelled = true; };
+        setCoverFailed(false);
     }, [series.id, coverMode]);
+
+    const coverSrc = (window as any).api.coverUrl(series.id, coverMode);
 
     const handleDelete = (e: React.MouseEvent) => {
         e.stopPropagation();
@@ -82,12 +75,12 @@ export default function SeriesCard({
                     position: 'relative',
                 }}
             >
-                {loading ? (
-                    <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>加载中...</span>
-                ) : cover ? (
+                {!coverFailed ? (
                     <img
-                        src={cover}
+                        src={coverSrc}
                         alt={series.title}
+                        draggable={false}
+                        onError={() => setCoverFailed(true)}
                         style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                     />
                 ) : (
@@ -148,6 +141,29 @@ export default function SeriesCard({
                         }}
                     >
                         🗑️
+                    </button>
+                )}
+
+                {/* ⭐ 悬停时的详情按钮（左上角）：章节 + 标签都在详情页里 */}
+                {hover && onOpenDetail && (
+                    <button
+                        onClick={e => { e.stopPropagation(); onOpenDetail(series); }}
+                        title="打开详情（章节 / 标签）"
+                        style={{
+                            position: 'absolute',
+                            top: 6,
+                            left: 6,
+                            padding: '3px 9px',
+                            borderRadius: 6,
+                            background: 'rgba(0,0,0,0.65)',
+                            color: 'white',
+                            fontSize: 11,
+                            border: 'none',
+                            cursor: 'pointer',
+                            zIndex: 2,
+                        }}
+                    >
+                        详情
                     </button>
                 )}
             </div>

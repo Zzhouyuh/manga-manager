@@ -258,18 +258,10 @@ function FavoriteThumb({
     onDelete: (id: number) => void;
     onClick: (p: FavoritePage) => void;
 }) {
-    const [src, setSrc] = useState<string | null>(null);
     const [hover, setHover] = useState(false);
 
-    useEffect(() => {
-        let cancelled = false;
-        (async () => {
-            const api = (window as any).api;
-            const data = await api.getImage(page.image_path);
-            if (!cancelled) setSrc(data);
-        })();
-        return () => { cancelled = true; };
-    }, [page.image_path]);
+    // ⭐ 走 manga:// 协议加载缩略图
+    const src: string | null = (window as any).api.imageUrl(page.image_path, 320);
 
     return (
         <div

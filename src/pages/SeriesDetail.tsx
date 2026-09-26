@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react';
 import type { Chapter } from '../types';
+import SeriesTags from '../components/SeriesTags';
 import ProgressBar from '../components/ProgressBar';
 
 type Props = {
     seriesId: number;
     seriesTitle: string;
     onOpenImageWall: (chapterId: number, chapterTitle: string) => void;
+    onTagsChanged?: () => void;
 };
 
-export default function SeriesDetail({ seriesId, seriesTitle, onOpenImageWall }: Props) {
+export default function SeriesDetail({ seriesId, seriesTitle, onOpenImageWall, onTagsChanged }: Props) {
     const [chapters, setChapters] = useState<Chapter[]>([]);
     const [loading, setLoading] = useState(true);
 
@@ -26,12 +28,17 @@ export default function SeriesDetail({ seriesId, seriesTitle, onOpenImageWall }:
         return <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-secondary)' }}>加载中...</div>;
     }
 
-    if (chapters.length === 0) {
-        return <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-secondary)' }}>这本漫画还没有章节</div>;
-    }
-
     return (
         <div style={{ maxWidth: 800, margin: '0 auto' }}>
+            {/* ⭐ 标签 */}
+            <SeriesTags seriesId={seriesId} onChanged={onTagsChanged} />
+
+            {chapters.length === 0 && (
+                <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-secondary)' }}>
+                    这本漫画还没有章节
+                </div>
+            )}
+
             {chapters.map((ch, i) => {
                 const total = ch.page_count || 1;
                 const progress = ch.last_read_page / total;
@@ -102,3 +109,4 @@ export default function SeriesDetail({ seriesId, seriesTitle, onOpenImageWall }:
         </div>
     );
 }
+

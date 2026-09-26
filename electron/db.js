@@ -33,6 +33,7 @@ function initDB() {
       format TEXT,
       page_count INTEGER DEFAULT 0,
       last_read_page INTEGER DEFAULT 0,
+      last_read_at DATETIME,
       is_read INTEGER DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
@@ -81,6 +82,25 @@ function initDB() {
         db.exec('ALTER TABLE series ADD COLUMN is_favorite INTEGER DEFAULT 0');
     } catch (e) {
         // 列已存在，忽略
+    }
+
+    // 兼容旧数据库：章节的最后阅读时间（用来排「继续阅读」和动态封面）
+    try {
+        db.exec('ALTER TABLE chapters ADD COLUMN last_read_at DATETIME');
+    } catch (e) {
+        // 列已存在，忽略
+    }
+
+    // 系列标题唯一：避免重复导入时建出同名系列（老库已有重名就先不建，手动确认）
+    try {
+        const dup = db.prepare('SELECT title FROM series GROUP BY title HAVING COUNT(*) > 1 LIMIT 1').get();
+        if (dup) {
+            console.warn('[db] 库里存在同名系列，跳过唯一索引:', dup.title);
+        } else {
+            db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_series_title ON series(title)');
+        }
+    } catch (e) {
+        console.warn('[db] 创建系列唯一索引失败（忽略）:', e.message);
     }
 }
 

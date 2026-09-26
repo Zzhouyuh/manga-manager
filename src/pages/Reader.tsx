@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ChapterImage, ReaderMode, ReaderDirection, ReaderFit } from '../types';
+import type { Chapter, ChapterImage, ReaderMode, ReaderDirection, ReaderFit } from '../types';
+import SeriesTags from '../components/SeriesTags';
 
 type Props = {
     chapterId: number;
@@ -8,6 +9,7 @@ type Props = {
     seriesId: number;
     startPage: number;
     onBack: (currentPage?: number) => void;
+    onSwitchChapter: (chapterId: number, chapterTitle: string) => void;
 };
 
 const LS_KEY = 'readerSettings';
@@ -30,19 +32,25 @@ function saveSettings(s: any) {
 }
 
 export default function Reader({
-                                   chapterId, chapterTitle, seriesTitle, seriesId, startPage, onBack,
+                                   chapterId, chapterTitle, seriesTitle, seriesId, startPage, onBack, onSwitchChapter,
                                }: Props) {
     const [images, setImages] = useState<ChapterImage[]>([]);
+    // ⭐ 同一系列的所有章节，用来算「上一话 / 下一话」
+    const [chapters, setChapters] = useState<Chapter[]>([]);
     const [current, setCurrent] = useState(startPage);
     const currentRef = useRef(current);
     useEffect(() => { currentRef.current = current; }, [current]);
 
     const [imgData, setImgData] = useState<string | null>(null);
     const [loading, setLoading] = useState(true);
+    const [imgError, setImgError] = useState(false);
+    // manga:// 协议取不到时的兜底（回退到 IPC 取图）
+    const [imgFallback, setImgFallback] = useState<string | null>(null);
     const [showToolbar, setShowToolbar] = useState(true);
 
     const [isPageFav, setIsPageFav] = useState(false);
     const [isSeriesFav, setIsSeriesFav] = useState(false);
+    const [tagPanel, setTagPanel] = useState(false);
 
     const [settings, setSettings] = useState(loadSettings);
     const [userZoom, setUserZoom] = useState(1);
@@ -93,22 +101,64 @@ export default function Reader({
         })();
     }, [chapterId]);
 
+    // ⭐ 切话时重置页码（同一个 Reader 组件实例会被复用，state 不会自己复位）
+    useEffect(() => {
+        setCurrent(startPage);
+        setImages([]);        // 清掉上一话的图片列表，避免闪一下旧内容
+        setImgData(null);
+        setImgError(false);
+        setNaturalSize(null);
+        setUserZoom(1);
+    }, [chapterId, startPage]);
+
+    // ⭐ 拉取同系列的章节列表，算出上一话/下一话
+    useEffect(() => {
+        (async () => {
+            if (!seriesId) return;
+            const api = (window as any).api;
+            const list = await api.listChapters(seriesId);
+            setChapters(list);
+        })();
+    }, [seriesId, chapterId]);
+
+    const chapterIndex = chapters.findIndex(c => c.id === chapterId);
+    const prevChapter = chapterIndex > 0 ? chapters[chapterIndex - 1] : null;
+    const nextChapter = chapterIndex >= 0 && chapterIndex < chapters.length - 1
+        ? chapters[chapterIndex + 1]
+        : null;
+
+    const goPrevChapter = () => {
+        if (prevChapter) onSwitchChapter(prevChapter.id, prevChapter.title);
+    };
+    const goNextChapter = () => {
+        if (nextChapter) onSwitchChapter(nextChapter.id, nextChapter.title);
+    };
+
+    // 翻页；到本章头/尾就自动切上一话/下一话
+    const step = (dir: number) => {
+        const target = currentRef.current + dir;
+        if (target < 0) {
+            if (prevChapter) goPrevChapter();
+            return;
+        }
+        if (target >= images.length) {
+            if (nextChapter) goNextChapter();
+            return;
+        }
+        setCurrent(target);
+    };
+
     useEffect(() => {
         if (settings.mode !== 'page') return;
         if (images.length === 0) return;
         if (current < 0 || current >= images.length) return;
-        let cancelled = false;
-        setLoading(true);
+        const api = (window as any).api;
         setNaturalSize(null);
-        (async () => {
-            const api = (window as any).api;
-            const data = await api.getImage(images[current].path);
-            if (cancelled) return;
-            setImgData(data);
-            setLoading(false);
-            api.updateProgress(chapterId, current + 1);
-        })();
-        return () => { cancelled = true; };
+        setImgError(false);
+        setImgFallback(null);
+        // ⭐ 直接给 URL 让浏览器加载（不再走 IPC + base64）
+        setImgData(api.imageUrl(images[current].path));
+        api.updateProgress(chapterId, current + 1);
     }, [current, images, chapterId, settings.mode]);
 
     useEffect(() => {
@@ -146,15 +196,17 @@ export default function Reader({
             if (e.key === '-') { e.preventDefault(); setUserZoom(z => Math.max(z - 0.25, 0.1)); return; }
             if (e.key === '0') { e.preventDefault(); setUserZoom(1); return; }
             if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); return; }
+            if (e.key === '[') { e.preventDefault(); goPrevChapter(); return; }
+            if (e.key === ']') { e.preventDefault(); goNextChapter(); return; }
             if (settings.mode === 'page') {
                 if (e.key === 'ArrowRight' || e.key === ' ') {
                     e.preventDefault();
                     const dir = settings.direction === 'ltr' ? 1 : -1;
-                    setCurrent(c => Math.max(0, Math.min(c + dir, images.length - 1)));
+                    step(dir);
                 } else if (e.key === 'ArrowLeft') {
                     e.preventDefault();
                     const dir = settings.direction === 'ltr' ? -1 : 1;
-                    setCurrent(c => Math.max(0, Math.min(c + dir, images.length - 1)));
+                    step(dir);
                 }
             } else {
                 const el = scrollContainerRef.current;
@@ -172,7 +224,8 @@ export default function Reader({
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [images.length, onBack, settings.mode, settings.direction]);
+    }, [images.length, onBack, settings.mode, settings.direction,
+        prevChapter?.id, nextChapter?.id]);
 
     const handleWheel = (e: React.WheelEvent) => {
         if (e.ctrlKey || e.metaKey) {
@@ -193,8 +246,8 @@ export default function Reader({
         return () => document.removeEventListener('fullscreenchange', handler);
     }, []);
 
-    const prev = () => setCurrent(c => Math.max(c - 1, 0));
-    const next = () => setCurrent(c => Math.min(c + 1, images.length - 1));
+    const prev = () => step(-1);
+    const next = () => step(1);
 
     const handleTogglePageFav = async () => {
         const api = (window as any).api;
@@ -304,6 +357,37 @@ export default function Reader({
                         <span style={{ marginLeft: 12, opacity: 0.7 }}>{seriesTitle}</span>
                     </div>
 
+                    {/* ⭐ 换话 */}
+                    <button
+                        onClick={goPrevChapter}
+                        disabled={!prevChapter}
+                        title="上一话（快捷键 [）"
+                        style={{
+                            ...toolBtnStyle,
+                            opacity: prevChapter ? 1 : 0.35,
+                            cursor: prevChapter ? 'pointer' : 'default',
+                        }}
+                    >
+                        ⏮
+                    </button>
+                    {chapters.length > 1 && (
+                        <span style={{ minWidth: 58, textAlign: 'center', opacity: 0.75 }}>
+                            {chapterIndex + 1} / {chapters.length} 话
+                        </span>
+                    )}
+                    <button
+                        onClick={goNextChapter}
+                        disabled={!nextChapter}
+                        title="下一话（快捷键 ]）"
+                        style={{
+                            ...toolBtnStyle,
+                            opacity: nextChapter ? 1 : 0.35,
+                            cursor: nextChapter ? 'pointer' : 'default',
+                        }}
+                    >
+                        ⏭
+                    </button>
+
                     <button onClick={() => setUserZoom(z => Math.max(0.1, z - 0.25))} style={toolBtnStyle}>➖</button>
                     <span style={{ minWidth: 50, textAlign: 'center' }}>
             {settings.mode === 'page'
@@ -360,6 +444,18 @@ export default function Reader({
                         {isSeriesFav ? '❤️' : '♡'}
                     </button>
 
+                    {/* ⭐ 标签 */}
+                    <button
+                        onClick={() => setTagPanel(v => !v)}
+                        title="给这本漫画打标签"
+                        style={{
+                            ...toolBtnStyle,
+                            background: tagPanel ? 'rgba(255,255,255,0.3)' : toolBtnStyle.background,
+                        }}
+                    >
+                        🏷
+                    </button>
+
                     <button onClick={toggleFullscreen} style={toolBtnStyle}>
                         {isFullscreen ? '⤢' : '⛶'}
                     </button>
@@ -367,6 +463,41 @@ export default function Reader({
                     <div style={{ minWidth: 60, textAlign: 'right' }}>
                         {current + 1} / {images.length}
                     </div>
+                </div>
+            )}
+
+            {/* ⭐ 标签小面板 */}
+            {tagPanel && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: 56,
+                        right: 12,
+                        zIndex: 20,
+                        maxWidth: 'min(560px, 85vw)',
+                        padding: 12,
+                        borderRadius: 8,
+                        background: 'rgba(0,0,0,0.92)',
+                        border: '1px solid rgba(255,255,255,0.15)',
+                    }}
+                >
+                    <div
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            marginBottom: 8,
+                        }}
+                    >
+                        <span style={{ color: '#bbb', fontSize: 11 }}>给「{seriesTitle}」打标签</span>
+                        <button
+                            onClick={() => setTagPanel(false)}
+                            style={{ color: '#bbb', fontSize: 14, lineHeight: 1 }}
+                        >
+                            ×
+                        </button>
+                    </div>
+                    <SeriesTags seriesId={seriesId} compact />
                 </div>
             )}
 
@@ -382,11 +513,9 @@ export default function Reader({
                         overflow: 'auto',
                     }}
                 >
-                    {loading ? (
-                        <span style={{ color: '#888' }}>加载中...</span>
-                    ) : imgData ? (
+                    {imgData ? (
                         <img
-                            src={imgData}
+                            src={imgFallback || imgData}
                             alt={`第 ${current + 1} 页`}
                             style={pageImgStyle}
                             draggable={false}
@@ -394,10 +523,39 @@ export default function Reader({
                                 const img = e.currentTarget;
                                 setNaturalSize({ w: img.naturalWidth, h: img.naturalHeight });
                             }}
+                            onError={async () => {
+                                // manga:// 挂了就退回 IPC 取图（老路子，稳）
+                                if (!imgFallback) {
+                                    const api = (window as any).api;
+                                    const data = await api.getImage(images[current].path);
+                                    if (data) { setImgFallback(data); return; }
+                                }
+                                setImgError(true);
+                                setImgData(null);
+                            }}
                             onDoubleClick={() => setUserZoom(1)}
                         />
-                    ) : (
+                    ) : imgError ? (
                         <span style={{ color: '#888' }}>图片加载失败</span>
+                    ) : (
+                        <span style={{ color: '#888' }}>加载中...</span>
+                    )}
+
+                    {/* ⭐ 预加载下一页，翻页时基本无等待 */}
+                    {settings.mode === 'page' && images[current + 1] && (
+                        <img
+                            src={(window as any).api.imageUrl(images[current + 1].path)}
+                            alt=""
+                            aria-hidden
+                            draggable={false}
+                            style={{
+                                position: 'absolute',
+                                width: 1,
+                                height: 1,
+                                opacity: 0,
+                                pointerEvents: 'none',
+                            }}
+                        />
                     )}
 
                     {!loading && (
@@ -455,8 +613,8 @@ export default function Reader({
                     }}
                 >
                     {settings.mode === 'page'
-                        ? '← → 翻页 · +/− 缩放 · 0 复位 · Ctrl+滚轮 缩放 · 双击复位 · F 隐藏工具栏 · F11 全屏 · ESC 返回'
-                        : '↑ ↓ / PgUp PgDn 滚动 · +/− 缩放 · 0 复位 · Ctrl+滚轮 缩放 · F 隐藏工具栏 · F11 全屏 · ESC 返回'}
+                        ? '← → 翻页（到底自动切下一话）· [ ] 换话 · +/− 缩放 · 0 复位 · Ctrl+滚轮 缩放 · 双击复位 · F 隐藏工具栏 · F11 全屏 · ESC 返回'
+                        : '↑ ↓ / PgUp PgDn 滚动 · [ ] 换话 · +/− 缩放 · 0 复位 · Ctrl+滚轮 缩放 · F 隐藏工具栏 · F11 全屏 · ESC 返回'}
                 </div>
             )}
         </div>
@@ -471,9 +629,9 @@ function ScrollPage({
     userZoom: number;
     containerWidth: number;
 }) {
-    const [src, setSrc] = useState<string | null>(null);
     const [shouldLoad, setShouldLoad] = useState(false);
     const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+    const [fallback, setFallback] = useState<string | null>(null);
     const pageRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -492,16 +650,8 @@ function ScrollPage({
         return () => observer.disconnect();
     }, []);
 
-    useEffect(() => {
-        if (!shouldLoad) return;
-        let cancelled = false;
-        (async () => {
-            const api = (window as any).api;
-            const data = await api.getImage(imagePath);
-            if (!cancelled) setSrc(data);
-        })();
-        return () => { cancelled = true; };
-    }, [shouldLoad, imagePath]);
+    // ⭐ 走 manga:// 协议直接加载原图
+    const src: string | null = shouldLoad ? (window as any).api.imageUrl(imagePath) : null;
 
     const imgStyle: React.CSSProperties = (() => {
         const baseWidth = containerWidth || 800;
@@ -531,13 +681,19 @@ function ScrollPage({
         >
             {src ? (
                 <img
-                    src={src}
+                    src={fallback || src}
                     alt={`第 ${index + 1} 页`}
                     style={imgStyle}
                     draggable={false}
                     onLoad={e => {
                         const img = e.currentTarget;
                         setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+                    }}
+                    onError={async () => {
+                        if (fallback) return;
+                        const api = (window as any).api;
+                        const data = await api.getImage(imagePath);
+                        if (data) setFallback(data);
                     }}
                 />
             ) : (

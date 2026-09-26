@@ -163,19 +163,11 @@ function LazyImageWrapper({
     onToggleFav: (e: React.MouseEvent) => void;
     onClick: () => void;
 }) {
-    const [src, setSrc] = useState<string | null>(null);
     const [shouldLoad, setShouldLoad] = useState(false);
+    const [fallback, setFallback] = useState<string | null>(null);
 
-    useEffect(() => {
-        if (!shouldLoad) return;
-        let cancelled = false;
-        (async () => {
-            const api = (window as any).api;
-            const data = await api.getImage(imagePath);
-            if (!cancelled) setSrc(data);
-        })();
-        return () => { cancelled = true; };
-    }, [shouldLoad, imagePath]);
+    // ⭐ 走 manga:// 协议直接由浏览器加载缩略图（不再 IPC + base64）
+    const src = shouldLoad ? (window as any).api.imageUrl(imagePath, 320) : null;
 
     return (
         <div
@@ -212,8 +204,15 @@ function LazyImageWrapper({
         >
             {src ? (
                 <img
-                    src={src}
+                    src={fallback || src}
                     alt={`第 ${index + 1} 页`}
+                    onError={async () => {
+                        // 协议取不到就退回 IPC 生成的缩略图
+                        if (fallback) return;
+                        const api = (window as any).api;
+                        const data = await api.getThumbnail(imagePath, 320);
+                        if (data) setFallback(data);
+                    }}
                     style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                 />
             ) : (

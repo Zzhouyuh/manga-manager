@@ -31,6 +31,14 @@ export type ChapterImage = {
     index: number;
 };
 
+// ⭐ 标签
+export type Tag = {
+    id: number;
+    name: string;
+    color: string;
+    series_count?: number;
+};
+
 export type RecentItem = {
     series_id: number;
     series_title: string;

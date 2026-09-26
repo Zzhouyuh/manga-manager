@@ -1,6 +1,6 @@
 {
   "name": "MangaManager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "漫画管理器一个",
   "author": "Clare",
   "main": "electron/main.js",
