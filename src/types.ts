@@ -8,6 +8,9 @@ export type Series = {
     is_favorite: number;
     created_at: string;
     chapter_count: number;
+    page_count?: number;
+    reading_seconds?: number;
+    last_read_at?: string | null;
     first_chapter_id?: number;
     last_read_chapter_id?: number | null;
 };
@@ -21,6 +24,8 @@ export type Chapter = {
     format: string;
     page_count: number;
     last_read_page: number;
+    last_read_at?: string | null;
+    reading_seconds?: number;
     is_read: number;
     created_at: string;
 };
@@ -59,6 +64,9 @@ export type AppSettings = {
 };
 
 // 页面路由栈（每个元素代表一层）
+// 阅读器是从哪里进来的，返回时就回到哪里
+export type RouteOrigin = 'home' | 'library' | 'favorites' | 'seriesDetail' | 'imageWall';
+
 export type Route =
     | { name: 'home' }
     | { name: 'library' }
@@ -66,7 +74,7 @@ export type Route =
     | { name: 'settings' }
     | { name: 'seriesDetail'; seriesId: number; seriesTitle: string }
     | { name: 'imageWall'; chapterId: number; chapterTitle: string; seriesId: number; seriesTitle: string; isSingleChapter: boolean }
-    | { name: 'reader'; chapterId: number; chapterTitle: string; seriesId: number; seriesTitle: string; startPage: number };
+    | { name: 'reader'; chapterId: number; chapterTitle: string; seriesId: number; seriesTitle: string; startPage: number; from: RouteOrigin; wallSingle?: boolean };
 // ⭐ 阅读器设置
 export type ReaderMode = 'page' | 'scroll';
 export type ReaderDirection = 'ltr' | 'rtl';

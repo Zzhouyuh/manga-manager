@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { Chapter, ChapterImage, ReaderMode, ReaderDirection, ReaderFit } from '../types';
 import SeriesTags from '../components/SeriesTags';
+import { formatDuration } from '../utils/format';
 
 type Props = {
     chapterId: number;
@@ -19,6 +20,7 @@ function loadSettings() {
         mode: 'page' as ReaderMode,
         direction: 'ltr' as ReaderDirection,
         fit: 'window' as ReaderFit,   // ⭐ 默认改成"适应窗口"
+        autoSpread: true,             // ⭐ 跨页（躺倒的图）自动转正
     };
     try {
         const raw = localStorage.getItem(LS_KEY);
@@ -30,6 +32,31 @@ function loadSettings() {
 function saveSettings(s: any) {
     try { localStorage.setItem(LS_KEY, JSON.stringify(s)); } catch { /* ignore */ }
 }
+
+// ⭐ 手动旋转记忆（按图片路径）与"这页别自动转"的黑名单
+const ROT_LS_KEY = 'readerPageRotations';
+const NOAUTO_LS_KEY = 'readerSpreadNoAuto';
+const ROT_LS_MAX = 4000;
+
+function loadMap(key: string): Record<string, any> {
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return obj && typeof obj === 'object' ? obj : {};
+    } catch { return {}; }
+}
+
+function saveMap(key: string, map: Record<string, any>) {
+    try {
+        let entries = Object.entries(map);
+        // 记太多就丢掉最旧的一部分（对象 key 顺序 = 插入顺序）
+        if (entries.length > ROT_LS_MAX) entries = entries.slice(entries.length - ROT_LS_MAX);
+        localStorage.setItem(key, JSON.stringify(Object.fromEntries(entries)));
+    } catch { /* ignore */ }
+}
+
+const normDeg = (d: number) => ((Math.round(d / 90) * 90) % 360 + 360) % 360;
 
 export default function Reader({
                                    chapterId, chapterTitle, seriesTitle, seriesId, startPage, onBack, onSwitchChapter,
@@ -55,12 +82,90 @@ export default function Reader({
     const [settings, setSettings] = useState(loadSettings);
     const [userZoom, setUserZoom] = useState(1);
     const [isFullscreen, setIsFullscreen] = useState(false);
+    // ⭐ 工具栏默认不显示：鼠标一动就出现，静止 3 秒后再次收起
+    const [toolbarVisible, setToolbarVisible] = useState(false);
+    const toolbarTimer = useRef<number | null>(null);
+    const toolbarHover = useRef(false);
+    const toolbarVisibleRef = useRef(false);
+    // ⭐ 左键拖动平移
+    const dragRef = useRef({ active: false, moved: false, x: 0, y: 0, left: 0, top: 0 });
+    const [dragging, setDragging] = useState(false);
 
     const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
     const [containerSize, setContainerSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
     const containerRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const [scrollContainerWidth, setScrollContainerWidth] = useState(0);
+
+    // ⭐ 旋转：手动按页记忆 + 跨页自动矫正
+    const [manualRot, setManualRot] = useState<Record<string, number>>(() => loadMap(ROT_LS_KEY));
+    const [noAutoRot, setNoAutoRot] = useState<Record<string, boolean>>(() => loadMap(NOAUTO_LS_KEY));
+    useEffect(() => { saveMap(ROT_LS_KEY, manualRot); }, [manualRot]);
+    useEffect(() => { saveMap(NOAUTO_LS_KEY, noAutoRot); }, [noAutoRot]);
+    // 每页原始宽高（主进程只读文件头，很快）；拿不到就不做自动矫正
+    const [pageSizes, setPageSizes] = useState<({ w: number; h: number; bytes?: number } | null)[] | null>(null);
+
+    useEffect(() => {
+        let alive = true;
+        setPageSizes(null);
+        (async () => {
+            const api = (window as any).api;
+            if (!api || !api.getChapterImageSizes) return;
+            try {
+                const sizes = await api.getChapterImageSizes(chapterId);
+                if (alive) setPageSizes(Array.isArray(sizes) ? sizes : null);
+            } catch { if (alive) setPageSizes(null); }
+        })();
+        return () => { alive = false; };
+    }, [chapterId]);
+
+    /**
+     * ⭐ 跨页判定（纯几何，保守）
+     * 躺倒的跨页有个稳定特征：把它转 90° 之后，宽高比正好约等于"两页并排"
+     * （也就是本书正常页比例的 2 倍），并且它自己明显比正常页宽。
+     * 只用比例判断会误伤 3:4 之类的普通页，所以两个条件都要满足。
+     */
+    const spreadFlags = useMemo(() => {
+        if (!pageSizes || pageSizes.length === 0) return [] as boolean[];
+        const ratios = pageSizes
+            .filter((s): s is { w: number; h: number; bytes?: number } => !!s && s.w > 0 && s.h > 0)
+            .map(s => s.w / s.h)
+            .filter(r => r > 0.5 && r < 0.95)
+            .sort((a, b) => a - b);
+        if (ratios.length < 12) return pageSizes.map(() => false);
+        const r0 = ratios[Math.floor(ratios.length / 2)];
+        const flags = pageSizes.map(s => {
+            if (!s || !s.w || !s.h) return false;
+            if (s.w < 300 || s.h < 300) return false;         // 小图标/缩略图不算
+            // ⭐ 空白页（版权页/说明页）压出来很小，直接排除，免得被当成跨页
+            if (s.bytes && s.bytes / (s.w * s.h) < 0.06) return false;
+            const r = s.w / s.h;
+            if (r <= 0.5 || r >= 0.95) return false;           // 不是竖着存的
+            if (r < r0 * 1.03) return false;                   // 没比正常页宽，肯定不是跨页
+            const dev = Math.abs(1 / r - 2 * r0) / (2 * r0);
+            return dev <= 0.05;                                // 转正后 ≈ 两页并排
+        });
+        // ⭐ 兜底保护：一话里超过一半都"疑似跨页"说明这批扫描彻底不规整，判定不可信，
+        // 这种情况宁可不自动转（交回手动）。烙印战士这种跨页很多的卷（约 30%）不受影响。
+        const hitCount = flags.filter(Boolean).length;
+        if (hitCount > flags.length * 0.5) return flags.map(() => false);
+        return flags;
+    }, [pageSizes]);
+
+    // 某一页最终该转多少度：手动优先 > 自动矫正
+    const rotationFor = (index: number) => {
+        const img = images[index];
+        if (!img) return 0;
+        const manual = manualRot[img.path];
+        if (typeof manual === 'number') return normDeg(manual);
+        if (settings.autoSpread !== false && spreadFlags[index] && !noAutoRot[img.path]) return 90;
+        return 0;
+    };
+    const isAutoRotated = (index: number) => {
+        const img = images[index];
+        if (!img || typeof manualRot[img.path] === 'number') return false;
+        return settings.autoSpread !== false && !!spreadFlags[index] && !noAutoRot[img.path];
+    };
 
     useEffect(() => { saveSettings(settings); }, [settings]);
 
@@ -177,11 +282,18 @@ export default function Reader({
         })();
     }, [seriesId]);
 
+    // ⭐ 旋转后的"有效尺寸"：转了 90/270 宽高互换，缩放要按转完的比例算
+    const rotation = rotationFor(current);
+    const swapped = rotation % 180 !== 0;
+    const rotatedSize = naturalSize
+        ? (swapped ? { w: naturalSize.h, h: naturalSize.w } : { w: naturalSize.w, h: naturalSize.h })
+        : null;
+
     // ⭐ 基础缩放
     const baseScale = (() => {
-        if (!naturalSize || containerSize.w === 0 || containerSize.h === 0) return 1;
-        const scaleW = containerSize.w / naturalSize.w;
-        const scaleH = containerSize.h / naturalSize.h;
+        if (!rotatedSize || containerSize.w === 0 || containerSize.h === 0) return 1;
+        const scaleW = containerSize.w / rotatedSize.w;
+        const scaleH = containerSize.h / rotatedSize.h;
         if (settings.fit === 'window') return Math.min(scaleW, scaleH);   // ⭐ 适应窗口
         if (settings.fit === 'width') return scaleW;
         if (settings.fit === 'height') return scaleH;
@@ -198,6 +310,10 @@ export default function Reader({
             if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); return; }
             if (e.key === '[') { e.preventDefault(); goPrevChapter(); return; }
             if (e.key === ']') { e.preventDefault(); goNextChapter(); return; }
+            // ⭐ 旋转：, 左转 90°，. 右转 90°，r 复位
+            if (e.key === ',') { e.preventDefault(); rotateBy(-90); return; }
+            if (e.key === '.') { e.preventDefault(); rotateBy(90); return; }
+            if (e.key === 'r' || e.key === 'R') { e.preventDefault(); resetRotation(); return; }
             if (settings.mode === 'page') {
                 if (e.key === 'ArrowRight' || e.key === ' ') {
                     e.preventDefault();
@@ -224,8 +340,8 @@ export default function Reader({
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [images.length, onBack, settings.mode, settings.direction,
-        prevChapter?.id, nextChapter?.id]);
+    }, [images.length, images, onBack, settings.mode, settings.direction, settings.autoSpread,
+        prevChapter?.id, nextChapter?.id, current, rotation, spreadFlags]);
 
     const handleWheel = (e: React.WheelEvent) => {
         if (e.ctrlKey || e.metaKey) {
@@ -239,6 +355,191 @@ export default function Reader({
         if (!document.fullscreenElement) document.documentElement.requestFullscreen();
         else document.exitFullscreen();
     };
+
+    // ==================== ⭐ 工具栏自动收起 ====================
+    useEffect(() => {
+        const wake = () => {
+            if (!toolbarVisibleRef.current) {
+                toolbarVisibleRef.current = true;
+                setToolbarVisible(true);
+            }
+            if (toolbarTimer.current) window.clearTimeout(toolbarTimer.current);
+            toolbarTimer.current = window.setTimeout(() => {
+                if (toolbarHover.current) return;
+                toolbarVisibleRef.current = false;
+                setToolbarVisible(false);
+            }, 3000);
+        };
+        // 一开始不主动显示：鼠标动了（或滚轮）才滑出
+        window.addEventListener('mousemove', wake);
+        window.addEventListener('wheel', wake, { passive: true });
+        return () => {
+            window.removeEventListener('mousemove', wake);
+            window.removeEventListener('wheel', wake);
+            if (toolbarTimer.current) window.clearTimeout(toolbarTimer.current);
+        };
+    }, []);
+
+    // ==================== ⭐ 左键拖动平移 ====================
+    // 内容超出容器（放大后 / 长图）才允许拖，避免影响单击翻页
+    const beginDrag = (e: React.MouseEvent, el: HTMLElement | null) => {
+        if (e.button !== 0 || !el) return;
+        if (el.scrollWidth <= el.clientWidth + 4 && el.scrollHeight <= el.clientHeight + 4) return;
+        dragRef.current = {
+            active: true, moved: false,
+            x: e.clientX, y: e.clientY,
+            left: el.scrollLeft, top: el.scrollTop,
+        };
+        setDragging(true);
+
+        // 拖动中监听整个窗口，鼠标划出容器也不会断
+        const onMove = (ev: MouseEvent) => {
+            const d = dragRef.current;
+            if (!d.active) return;
+            const dx = ev.clientX - d.x;
+            const dy = ev.clientY - d.y;
+            if (!d.moved && Math.abs(dx) + Math.abs(dy) > 4) d.moved = true;
+            el.scrollLeft = d.left - dx;
+            el.scrollTop = d.top - dy;
+        };
+        const onUp = () => {
+            dragRef.current.active = false;
+            setDragging(false);
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+            // 让紧随其后的 click 事件能读到 moved，然后复位
+            window.setTimeout(() => { dragRef.current.moved = false; }, 0);
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+    };
+
+    // 单击翻页（刚拖动过就不翻）；连点两下 = 连翻两页，方便快速翻页
+    const turnByClick = (dir: number) => (e: React.MouseEvent) => {
+        if (dragRef.current.moved) return;
+        step(dir);
+    };
+
+    // ==================== ⭐ 双击放大（以点击位置为中心）/ 复位 ====================
+    const handleDoubleClick = (e: React.MouseEvent) => {
+        const el = containerRef.current;
+        if (!el) return;
+
+        // 已经放大了：双击任意位置都算复位
+        if (userZoom > 1.05) {
+            setUserZoom(1);
+            return;
+        }
+
+        // 没放大时：只有中间区域双击才放大
+        // 左右各 20% 是翻页热区，快速连点那里 = 连翻两页，不该被误解成放大手势
+        const rect = el.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const w = rect.width || 1;
+        if (x < w * 0.2 || x > w * 0.8) return;
+
+        const ox = e.clientX - rect.left;
+        const oy = e.clientY - rect.top;
+        const fx = (el.scrollLeft + ox) / Math.max(1, el.scrollWidth);
+        const fy = (el.scrollTop + oy) / Math.max(1, el.scrollHeight);
+        setUserZoom(2);
+        // 等缩放应用完，再把点击位置滚回原处
+        requestAnimationFrame(() => {
+            const el2 = containerRef.current;
+            if (!el2) return;
+            el2.scrollLeft = fx * el2.scrollWidth - ox;
+            el2.scrollTop = fy * el2.scrollHeight - oy;
+        });
+    };
+
+    // 内容是否超出容器（用来决定鼠标指针形状）
+    const canPan = userZoom > 1.05 || (settings.mode === 'page' && !!naturalSize && (
+        (rotatedSize ? rotatedSize.w : naturalSize.w) * actualScale > containerSize.w + 4 ||
+        (rotatedSize ? rotatedSize.h : naturalSize.h) * actualScale > containerSize.h + 4
+    ));
+
+    // ⭐ 右键菜单
+    const handleContextMenu = async (e: React.MouseEvent) => {
+        e.preventDefault();
+        const api = (window as any).api;
+        const chapter = await api.getChapter(chapterId);
+        const filePath: string = (chapter && chapter.file_path) || '';
+
+        const action = await api.contextMenu([
+            { id: 'fav', label: isPageFav ? `取消收藏第 ${current + 1} 页` : `收藏第 ${current + 1} 页` },
+            { separator: true },
+            { id: 'rot-l', label: '左转 90°' },
+            { id: 'rot-r', label: '右转 90°' },
+            { id: 'rot-0', label: `恢复原方向${rotation ? '（当前 ' + rotation + '°）' : ''}`, enabled: rotation !== 0 },
+            { separator: true },
+            { id: 'reveal', label: '打开漫画文件所在位置', enabled: !!filePath },
+            { id: 'copy', label: '复制文件路径', enabled: !!filePath },
+            { separator: true },
+            { id: 'toolbar', label: showToolbar ? '隐藏工具栏' : '显示工具栏' },
+        ]);
+        if (!action) return;
+
+        if (action === 'fav') {
+            await handleTogglePageFav();
+        } else if (action === 'rot-l') {
+            rotateBy(-90);
+        } else if (action === 'rot-r') {
+            rotateBy(90);
+        } else if (action === 'rot-0') {
+            resetRotation();
+        } else if (action === 'toolbar') {
+            setShowToolbar(v => !v);
+            setToolbarVisible(true);
+            toolbarVisibleRef.current = true;
+        } else if (action === 'reveal') {
+            const r = await api.revealPath(filePath);
+            if (!r.success) alert('打开失败：' + (r.error || '未知错误'));
+        } else if (action === 'copy') {
+            await api.copyText(filePath);
+        }
+    };
+
+    // ==================== ⭐ 阅读时长计时器 ====================
+    // 只在本话里累计：窗口可见且聚焦时才计时（切走、最小化不算）
+    const baseSecondsRef = useRef(0);      // 本话历史累计（来自数据库）
+    const pendingRef = useRef(0);          // 还没写进数据库的秒数
+    const baseInitedRef = useRef<number | null>(null);
+    const [readSeconds, setReadSeconds] = useState(0);
+
+    useEffect(() => {
+        if (baseInitedRef.current === chapterId) return;   // 同一话只初始化一次
+        baseInitedRef.current = chapterId;
+        const me = chapters.find(c => c.id === chapterId);
+        baseSecondsRef.current = (me && me.reading_seconds) || 0;
+        pendingRef.current = 0;
+        setReadSeconds(baseSecondsRef.current);
+    }, [chapters, chapterId]);
+
+    useEffect(() => {
+        const timer = window.setInterval(() => {
+            if (document.hidden || !document.hasFocus()) return;
+            pendingRef.current += 1;
+            setReadSeconds(s => s + 1);
+        }, 1000);
+        return () => window.clearInterval(timer);
+    }, []);
+
+    // 每 15 秒落一次库；切话或离开阅读器时也会落
+    useEffect(() => {
+        const flush = () => {
+            const s = pendingRef.current;
+            if (s <= 0) return;
+            pendingRef.current = 0;
+            baseSecondsRef.current += s;
+            const api = (window as any).api;
+            if (api && api.addReadingTime) api.addReadingTime(chapterId, s);
+        };
+        const timer = window.setInterval(flush, 15000);
+        return () => {
+            window.clearInterval(timer);
+            flush();
+        };
+    }, [chapterId]);
 
     useEffect(() => {
         const handler = () => setIsFullscreen(!!document.fullscreenElement);
@@ -267,14 +568,53 @@ export default function Reader({
         if (result.success) setIsSeriesFav(result.is_favorite === 1);
     };
 
+    // ⭐ 旋转用 CSS transform 做：外面套一个"转完之后"尺寸的盒子，里面图片绕中心旋转
+    const dispW = naturalSize ? Math.max(1, Math.round(naturalSize.w * actualScale)) : 0;
+    const dispH = naturalSize ? Math.max(1, Math.round(naturalSize.h * actualScale)) : 0;
+    const boxW = swapped ? dispH : dispW;
+    const boxH = swapped ? dispW : dispH;
+
     const pageImgStyle: React.CSSProperties = naturalSize
         ? {
-            width: Math.round(naturalSize.w * actualScale),
-            height: Math.round(naturalSize.h * actualScale),
+            position: 'absolute',
+            left: Math.round((boxW - dispW) / 2),
+            top: Math.round((boxH - dispH) / 2),
+            width: dispW,
+            height: dispH,
+            transform: rotation ? `rotate(${rotation}deg)` : undefined,
             userSelect: 'none',
             display: 'block',
+            maxWidth: 'none',
         }
-        : { userSelect: 'none', display: 'block', maxWidth: '100%', maxHeight: '100%' };
+        : {
+            userSelect: 'none', display: 'block', maxWidth: '100%', maxHeight: '100%',
+            transform: rotation ? `rotate(${rotation}deg)` : undefined,
+        };
+
+    const pageWrapStyle: React.CSSProperties = naturalSize
+        ? { position: 'relative', width: boxW, height: boxH, flex: '0 0 auto' }
+        : { display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%' };
+
+    // ==================== ⭐ 手动旋转 / 撤销自动矫正 ====================
+    const rotateBy = (delta: number) => {
+        const img = images[current];
+        if (!img) return;
+        setManualRot(m => ({ ...m, [img.path]: normDeg(rotation + delta) }));
+    };
+
+    // 复位：回到"原图方向"；如果这页本来是自动转正的，就顺便拉黑，免得转回来又被自动转走
+    const resetRotation = () => {
+        const img = images[current];
+        if (!img) return;
+        setManualRot(m => {
+            const next = { ...m };
+            delete next[img.path];
+            return next;
+        });
+        if (settings.autoSpread !== false && spreadFlags[current]) {
+            setNoAutoRot(m => ({ ...m, [img.path]: true }));
+        }
+    };
 
     useEffect(() => {
         if (settings.mode !== 'scroll') return;
@@ -334,8 +674,10 @@ export default function Reader({
                 overflow: 'hidden',
             }}
         >
-            {showToolbar && (
+            {showToolbar && toolbarVisible && (
                 <div
+                    onMouseEnter={() => { toolbarHover.current = true; setToolbarVisible(true); toolbarVisibleRef.current = true; }}
+                    onMouseLeave={() => { toolbarHover.current = false; }}
                     style={{
                         position: 'absolute',
                         top: 0, left: 0, right: 0,
@@ -396,6 +738,29 @@ export default function Reader({
           </span>
                     <button onClick={() => setUserZoom(z => Math.min(5, z + 0.25))} style={toolBtnStyle}>➕</button>
                     <button onClick={() => setUserZoom(1)} style={toolBtnStyle}>⟳</button>
+
+                    {/* ⭐ 旋转：手动左右转 + 一键还原 + 跨页自动更正开关 */}
+                    <button onClick={() => rotateBy(-90)} title="左转 90°（快捷键 ,）" style={toolBtnStyle}>↺</button>
+                    <button onClick={() => rotateBy(90)} title="右转 90°（快捷键 .）" style={toolBtnStyle}>↻</button>
+                    {rotation !== 0 && (
+                        <button onClick={resetRotation} title="恢复原方向（快捷键 R）" style={{
+                            ...toolBtnStyle,
+                            background: 'rgba(234,179,8,0.28)',
+                            color: '#fbbf24',
+                        }}>0°</button>
+                    )}
+                    <button
+                        onClick={() => setSettings({ ...settings, autoSpread: settings.autoSpread === false })}
+                        title="躺倒的跨页自动转正（按比例判断，仅对 mobi/文件夹生效）"
+                        style={{
+                            ...toolBtnStyle,
+                            minWidth: 56,
+                            background: settings.autoSpread !== false ? 'rgba(34,197,94,0.28)' : toolBtnStyle.background,
+                            color: settings.autoSpread !== false ? '#86efac' : 'white',
+                        }}
+                    >
+                        跨页矫正
+                    </button>
 
                     {settings.mode === 'page' && (
                         <select
@@ -460,6 +825,10 @@ export default function Reader({
                         {isFullscreen ? '⤢' : '⛶'}
                     </button>
 
+                    <div style={{ minWidth: 64, textAlign: 'right' }} title="本话累计阅读时长">
+                        ⏱ {formatDuration(readSeconds)}
+                    </div>
+
                     <div style={{ minWidth: 60, textAlign: 'right' }}>
                         {current + 1} / {images.length}
                     </div>
@@ -501,9 +870,42 @@ export default function Reader({
                 </div>
             )}
 
+            {/* ⭐ 自动矫正提示：告诉用户这页被转过，并给一键还原 */}
+            {toolbarVisible && rotation !== 0 && isAutoRotated(current) && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: 56,
+                        left: 12,
+                        zIndex: 15,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        padding: '6px 10px',
+                        borderRadius: 6,
+                        background: 'rgba(34,197,94,0.22)',
+                        border: '1px solid rgba(34,197,94,0.45)',
+                        color: '#86efac',
+                        fontSize: 11,
+                    }}
+                >
+                    <span>检测到跨页，已自动转正</span>
+                    <button
+                        onClick={resetRotation}
+                        style={{ ...toolBtnStyle, padding: '2px 8px', fontSize: 11 }}
+                    >
+                        还原
+                    </button>
+                </div>
+            )}
+
             {settings.mode === 'page' && (
                 <div
                     ref={containerRef}
+                    onMouseDown={e => beginDrag(e, containerRef.current)}
+                    onDoubleClick={handleDoubleClick}
+                    onContextMenu={handleContextMenu}
+                    onDragStart={e => e.preventDefault()}
                     style={{
                         flex: 1,
                         display: 'flex',
@@ -511,30 +913,34 @@ export default function Reader({
                         justifyContent: 'center',
                         position: 'relative',
                         overflow: 'auto',
+                        cursor: dragging ? 'grabbing' : (canPan ? 'grab' : 'default'),
+                        userSelect: 'none',
                     }}
                 >
                     {imgData ? (
-                        <img
-                            src={imgFallback || imgData}
-                            alt={`第 ${current + 1} 页`}
-                            style={pageImgStyle}
-                            draggable={false}
-                            onLoad={e => {
-                                const img = e.currentTarget;
-                                setNaturalSize({ w: img.naturalWidth, h: img.naturalHeight });
-                            }}
-                            onError={async () => {
-                                // manga:// 挂了就退回 IPC 取图（老路子，稳）
-                                if (!imgFallback) {
-                                    const api = (window as any).api;
-                                    const data = await api.getImage(images[current].path);
-                                    if (data) { setImgFallback(data); return; }
-                                }
-                                setImgError(true);
-                                setImgData(null);
-                            }}
-                            onDoubleClick={() => setUserZoom(1)}
-                        />
+                        <div style={pageWrapStyle}>
+                            <img
+                                src={imgFallback || imgData}
+                                alt={`第 ${current + 1} 页`}
+                                style={pageImgStyle}
+                                draggable={false}
+                                decoding="async"
+                                onLoad={e => {
+                                    const img = e.currentTarget;
+                                    setNaturalSize({ w: img.naturalWidth, h: img.naturalHeight });
+                                }}
+                                onError={async () => {
+                                    // manga:// 挂了就退回 IPC 取图（老路子，稳）
+                                    if (!imgFallback) {
+                                        const api = (window as any).api;
+                                        const data = await api.getImage(images[current].path);
+                                        if (data) { setImgFallback(data); return; }
+                                    }
+                                    setImgError(true);
+                                    setImgData(null);
+                                }}
+                            />
+                        </div>
                     ) : imgError ? (
                         <span style={{ color: '#888' }}>图片加载失败</span>
                     ) : (
@@ -561,12 +967,18 @@ export default function Reader({
                     {!loading && (
                         <>
                             <div
-                                onClick={settings.direction === 'ltr' ? prev : next}
-                                style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '20%', cursor: 'w-resize' }}
+                                onClick={turnByClick(settings.direction === 'ltr' ? -1 : 1)}
+                                style={{
+                                    position: 'absolute', left: 0, top: 0, bottom: 0, width: '20%',
+                                    cursor: canPan ? (dragging ? 'grabbing' : 'grab') : 'w-resize',
+                                }}
                             />
                             <div
-                                onClick={settings.direction === 'ltr' ? next : prev}
-                                style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: '20%', cursor: 'e-resize' }}
+                                onClick={turnByClick(settings.direction === 'ltr' ? 1 : -1)}
+                                style={{
+                                    position: 'absolute', right: 0, top: 0, bottom: 0, width: '20%',
+                                    cursor: canPan ? (dragging ? 'grabbing' : 'grab') : 'e-resize',
+                                }}
                             />
                         </>
                     )}
@@ -576,12 +988,17 @@ export default function Reader({
             {settings.mode === 'scroll' && (
                 <div
                     ref={scrollContainerRef}
+                    onMouseDown={e => beginDrag(e, scrollContainerRef.current)}
+                    onContextMenu={handleContextMenu}
+                    onDragStart={e => e.preventDefault()}
                     style={{
                         flex: 1,
                         overflowY: 'auto',
                         overflowX: 'auto',
                         background: '#000',
                         paddingTop: 60,
+                        cursor: dragging ? 'grabbing' : (userZoom > 1.02 ? 'grab' : 'default'),
+                        userSelect: 'none',
                     }}
                 >
                     {images.length === 0 ? (
@@ -594,14 +1011,17 @@ export default function Reader({
                                 index={img.index}
                                 userZoom={userZoom}
                                 containerWidth={scrollContainerWidth}
+                                rotation={rotationFor(img.index)}
                             />
                         ))
                     )}
                 </div>
             )}
 
-            {showToolbar && (
+            {showToolbar && toolbarVisible && (
                 <div
+                    onMouseEnter={() => { toolbarHover.current = true; setToolbarVisible(true); toolbarVisibleRef.current = true; }}
+                    onMouseLeave={() => { toolbarHover.current = false; }}
                     style={{
                         position: 'absolute',
                         bottom: 0, left: 0, right: 0,
@@ -613,21 +1033,23 @@ export default function Reader({
                     }}
                 >
                     {settings.mode === 'page'
-                        ? '← → 翻页（到底自动切下一话）· [ ] 换话 · +/− 缩放 · 0 复位 · Ctrl+滚轮 缩放 · 双击复位 · F 隐藏工具栏 · F11 全屏 · ESC 返回'
-                        : '↑ ↓ / PgUp PgDn 滚动 · [ ] 换话 · +/− 缩放 · 0 复位 · Ctrl+滚轮 缩放 · F 隐藏工具栏 · F11 全屏 · ESC 返回'}
+                        ? '← → 翻页（到底自动切下一话）· 双击画面中间放大 · 放大后双击复位、左键拖动移动画面 · [ ] 换话 · +/− 缩放 · 0 复位缩放 · Ctrl+滚轮 缩放 · , . 左/右转 90° · R 恢复原方向 · F 隐藏工具栏 · F11 全屏 · ESC 返回'
+                        : '↑ ↓ / PgUp PgDn 滚动 · 左键拖动移动画面 · [ ] 换话 · +/− 缩放 · 0 复位缩放 · Ctrl+滚轮 缩放 · , . 左/右转 90° · R 恢复原方向 · F 隐藏工具栏 · F11 全屏 · ESC 返回'}
                 </div>
             )}
         </div>
     );
 }
 
-function ScrollPage({
-                        imagePath, index, userZoom, containerWidth,
+// ⭐ memo：阅读时长每秒刷新时，不要连带把整列页面重新渲染一遍
+const ScrollPage = memo(function ScrollPageInner({
+                        imagePath, index, userZoom, containerWidth, rotation,
                     }: {
     imagePath: string;
     index: number;
     userZoom: number;
     containerWidth: number;
+    rotation: number;
 }) {
     const [shouldLoad, setShouldLoad] = useState(false);
     const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
@@ -644,7 +1066,7 @@ function ScrollPage({
                     observer.disconnect();
                 }
             },
-            { rootMargin: '800px' }
+            { rootMargin: '450px' }   // 预取范围收小：滚动时不会一次解码太多大图
         );
         observer.observe(el);
         return () => observer.disconnect();
@@ -653,21 +1075,35 @@ function ScrollPage({
     // ⭐ 走 manga:// 协议直接加载原图
     const src: string | null = shouldLoad ? (window as any).api.imageUrl(imagePath) : null;
 
-    const imgStyle: React.CSSProperties = (() => {
-        const baseWidth = containerWidth || 800;
-        if (!natural) {
-            return { width: baseWidth * userZoom, height: 'auto', maxWidth: 'none', display: 'block' };
-        }
-        const displayWidth = baseWidth * userZoom;
-        const displayHeight = (natural.h / natural.w) * displayWidth;
-        return {
-            width: displayWidth,
-            height: displayHeight,
+    // ⭐ 转了 90/270 时宽高互换：外框按"转完之后"的尺寸，图片按原尺寸绕中心转
+    const swapped = rotation % 180 !== 0;
+    const baseWidth = containerWidth || 800;
+    const dispW = natural
+        ? baseWidth * userZoom
+        : baseWidth * userZoom;
+    const natW = natural ? (swapped ? natural.h : natural.w) : 1;
+    const natH = natural ? (swapped ? natural.w : natural.h) : 1;
+    const dispH = natural ? (natH / natW) * dispW : 0;
+    const imgW = natural ? (swapped ? dispH : dispW) : dispW;
+    const imgH = natural ? (swapped ? dispW : dispH) : undefined;
+
+    const boxStyle: React.CSSProperties = natural
+        ? { position: 'relative', width: dispW, height: dispH, flex: '0 0 auto' }
+        : { position: 'relative', width: dispW, flex: '0 0 auto' };
+
+    const imgStyle: React.CSSProperties = natural
+        ? {
+            position: 'absolute',
+            left: Math.round((dispW - imgW) / 2),
+            top: Math.round((dispH - (imgH || 0)) / 2),
+            width: imgW,
+            height: imgH,
             maxWidth: 'none',
             display: 'block',
             userSelect: 'none',
-        };
-    })();
+            transform: rotation ? `rotate(${rotation}deg)` : undefined,
+        }
+        : { width: imgW, height: 'auto', maxWidth: 'none', display: 'block', userSelect: 'none' };
 
     return (
         <div
@@ -680,22 +1116,25 @@ function ScrollPage({
             }}
         >
             {src ? (
-                <img
-                    src={fallback || src}
-                    alt={`第 ${index + 1} 页`}
-                    style={imgStyle}
-                    draggable={false}
-                    onLoad={e => {
-                        const img = e.currentTarget;
-                        setNatural({ w: img.naturalWidth, h: img.naturalHeight });
-                    }}
-                    onError={async () => {
-                        if (fallback) return;
-                        const api = (window as any).api;
-                        const data = await api.getImage(imagePath);
-                        if (data) setFallback(data);
-                    }}
-                />
+                <div style={boxStyle}>
+                    <img
+                        src={fallback || src}
+                        alt={`第 ${index + 1} 页`}
+                        style={imgStyle}
+                        draggable={false}
+                        decoding="async"
+                        onLoad={e => {
+                            const img = e.currentTarget;
+                            setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+                        }}
+                        onError={async () => {
+                            if (fallback) return;
+                            const api = (window as any).api;
+                            const data = await api.getImage(imagePath);
+                            if (data) setFallback(data);
+                        }}
+                    />
+                </div>
             ) : (
                 <div
                     style={{
@@ -714,7 +1153,7 @@ function ScrollPage({
             )}
         </div>
     );
-}
+});
 
 const toolBtnStyle: React.CSSProperties = {
     padding: '4px 8px',

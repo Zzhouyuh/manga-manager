@@ -9,10 +9,11 @@ type Props = {
     onDelete?: (series: Series) => void;
     onToggleFavorite?: (series: Series) => void;   // ⭐ 新增
     onOpenDetail?: (series: Series) => void;       // ⭐ 直接打开详情页（章节/标签）
+    onContextMenu?: (series: Series) => void;      // ⭐ 右键菜单
 };
 
 export default function SeriesCard({
-                                       series, coverMode, onClick, onDelete, onToggleFavorite, onOpenDetail,
+                                       series, coverMode, onClick, onDelete, onToggleFavorite, onOpenDetail, onContextMenu,
                                    }: Props) {
     // ⭐ 封面走 manga:// 协议，浏览器直接加载并自带缓存
     const [coverFailed, setCoverFailed] = useState(false);
@@ -48,6 +49,11 @@ export default function SeriesCard({
     return (
         <div
             onClick={() => onClick(series)}
+            onContextMenu={e => {
+                if (!onContextMenu) return;
+                e.preventDefault();
+                onContextMenu(series);
+            }}
             onMouseEnter={() => setHover(true)}
             onMouseLeave={() => setHover(false)}
             style={{
@@ -80,6 +86,8 @@ export default function SeriesCard({
                         src={coverSrc}
                         alt={series.title}
                         draggable={false}
+                        loading="lazy"
+                        decoding="async"
                         onError={() => setCoverFailed(true)}
                         style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                     />

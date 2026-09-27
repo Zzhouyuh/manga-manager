@@ -34,6 +34,7 @@ function initDB() {
       page_count INTEGER DEFAULT 0,
       last_read_page INTEGER DEFAULT 0,
       last_read_at DATETIME,
+      reading_seconds INTEGER DEFAULT 0,
       is_read INTEGER DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
@@ -87,6 +88,13 @@ function initDB() {
     // 兼容旧数据库：章节的最后阅读时间（用来排「继续阅读」和动态封面）
     try {
         db.exec('ALTER TABLE chapters ADD COLUMN last_read_at DATETIME');
+    } catch (e) {
+        // 列已存在，忽略
+    }
+
+    // 兼容旧数据库：章节累计阅读时长（秒）
+    try {
+        db.exec('ALTER TABLE chapters ADD COLUMN reading_seconds INTEGER DEFAULT 0');
     } catch (e) {
         // 列已存在，忽略
     }

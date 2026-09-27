@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, nativeImage, protocol, shell, Menu, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -218,6 +218,106 @@ function listChapterImages(chapter) {
     return [];
 }
 
+// ==================== ⭐ 页面尺寸（跨页自动矫正用） ====================
+// 只读文件/记录的头部字节就能拿到宽高，不用整张解码
+function imageSizeFromHeader(buf) {
+    if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+        let i = 2;
+        while (i < buf.length - 9) {
+            if (buf[i] !== 0xff) { i++; continue; }
+            const m = buf[i + 1];
+            if (m === 0xda || m === 0xd9) return null;                      // 进入压缩数据，没找到 SOF
+            if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+                return { w: buf.readUInt16BE(i + 7), h: buf.readUInt16BE(i + 5) };
+            }
+            if (m === 0xd8 || (m >= 0xd0 && m <= 0xd7) || m === 0x01) { i += 2; continue; }
+            const len = buf.readUInt16BE(i + 2);
+            if (len < 2) return null;
+            i += 2 + len;
+        }
+        return null;
+    }
+    if (buf.length > 24 && buf[0] === 0x89 && buf[1] === 0x50) {
+        return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };        // PNG
+    }
+    if (buf.length > 10 && buf.toString('latin1', 0, 3) === 'GIF') {
+        return { w: buf.readUInt16LE(6), h: buf.readUInt16LE(8) };          // GIF
+    }
+    if (buf.length > 26 && buf[0] === 0x42 && buf[1] === 0x4d) {
+        return { w: buf.readInt32LE(18), h: Math.abs(buf.readInt32LE(22)) }; // BMP
+    }
+    if (buf.length > 30 && buf.toString('latin1', 0, 4) === 'RIFF'
+        && buf.toString('latin1', 8, 12) === 'WEBP') {
+        const fmt = buf.toString('latin1', 12, 16);
+        if (fmt === 'VP8X') return { w: 1 + buf.readUIntLE(24, 3), h: 1 + buf.readUIntLE(27, 3) };
+        if (fmt === 'VP8 ') return { w: buf.readUInt16LE(26) & 0x3fff, h: buf.readUInt16LE(28) & 0x3fff };
+        if (fmt === 'VP8L') {
+            const b = buf.readUInt32LE(21);
+            return { w: (b & 0x3fff) + 1, h: ((b >> 14) & 0x3fff) + 1 };
+        }
+    }
+    return null;
+}
+
+// chapterId -> { stamp, sizes }
+const sizeCache = new Map();
+
+// 返回该话每页的 { w, h }（拿不到的一页是 null）；不支持格式返回 null
+function getChapterImageSizes(chapter) {
+    const key = `ch-${chapter.id}`;
+    let stamp = '0';
+    try {
+        const st = fs.statSync(chapter.file_path);
+        stamp = `${st.mtimeMs}-${st.size}`;
+    } catch { /* 文件没了就用 0，下面自然会拿到空 */ }
+
+    const cached = sizeCache.get(key);
+    if (cached && cached.stamp === stamp) return cached.sizes;
+
+    let sizes = null;
+    try {
+        if (chapter.format === 'folder') {
+            const images = listChapterImages(chapter);
+            if (images.length === 0 || images.length > 900) return null;
+            sizes = images.map(im => {
+                let fd = null;
+                try {
+                    fd = fs.openSync(im.path, 'r');
+                    const fileSize = fs.fstatSync(fd).size;
+                    const b = Buffer.alloc(Math.min(65536, fileSize));
+                    const n = fs.readSync(fd, b, 0, b.length, 0);
+                    const s = imageSizeFromHeader(b.subarray(0, n));
+                    return s ? { ...s, bytes: fileSize } : null;
+                } catch { return null; } finally {
+                    if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+                }
+            });
+        } else if (chapter.format === 'mobi') {
+            const info = parseMobi(chapter.file_path);
+            if (!info.success || info.images.length === 0 || info.images.length > 900) return null;
+            let fd = null;
+            try {
+                fd = fs.openSync(chapter.file_path, 'r');
+                sizes = info.images.map(img => {
+                    const n = Math.min(img.length, 65536);
+                    const b = Buffer.alloc(n);
+                    fs.readSync(fd, b, 0, n, img.start);
+                    const s = imageSizeFromHeader(b);
+                    return s ? { ...s, bytes: img.length } : null;
+                });
+            } finally {
+                if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+            }
+        }
+    } catch (e) {
+        console.warn('[页尺寸] 失败:', chapter.file_path, e.message);
+        return null;
+    }
+
+    if (sizes) sizeCache.set(key, { stamp, sizes });
+    return sizes;
+}
+
 // 把 "cbz::路径::条目" 这种伪路径拆开（Windows 路径里不可能出现 ::）
 function splitPseudoPath(pseudoPath) {
     const sep = pseudoPath.indexOf('::');
@@ -324,8 +424,45 @@ ipcMain.handle('get-thumbnail', async (_event, imagePath, maxWidth = 320) => {
  * 缩略图取字节（带磁盘缓存），给 IPC 和 manga:// 协议共用
  * 返回 { buffer, mime } 或 null
  */
-async function getThumbnailBuffer(imagePath, maxWidth = 320) {
+// ⭐ 图片处理队列
+// - 高优先级：后进先出（LIFO）—— 用户正划到的那些最先做
+// - 低优先级：先来先做 —— 后台预热整话缩略图用
+// 一次只解码一张，中间让出事件循环，主进程才不会被堵死
+const highJobStack = [];
+const lowJobQueue = [];
+let imageJobRunning = false;
+
+function enqueueImageJob(job, lowPriority = false) {
+    return new Promise((resolve, reject) => {
+        const item = { job, resolve, reject };
+        if (lowPriority) lowJobQueue.push(item);
+        else highJobStack.push(item);
+        pumpImageJobs();
+    });
+}
+
+async function pumpImageJobs() {
+    if (imageJobRunning) return;
+    imageJobRunning = true;
+    try {
+        while (highJobStack.length > 0 || lowJobQueue.length > 0) {
+            const item = highJobStack.length > 0 ? highJobStack.pop() : lowJobQueue.shift();
+            await new Promise(resolve => setImmediate(resolve));   // 先让主进程处理窗口/IPC 事件
+            try {
+                item.resolve(await item.job());
+            } catch (err) {
+                item.reject(err);
+            }
+        }
+    } finally {
+        imageJobRunning = false;
+    }
+}
+
+async function getThumbnailBuffer(imagePath, maxWidth = 320, opts = {}) {
     const width = Math.max(48, Math.min(1200, parseInt(maxWidth, 10) || 320));
+    const lowPriority = !!opts.lowPriority;
+    const isAborted = typeof opts.isAborted === 'function' ? opts.isAborted : () => false;
     const key = crypto.createHash('sha1')
         .update(`${imagePath}|${width}|${sourceStamp(imagePath)}`)
         .digest('hex');
@@ -337,18 +474,109 @@ async function getThumbnailBuffer(imagePath, maxWidth = 320) {
         } catch { /* 缓存读失败就重新生成 */ }
     }
 
-    const raw = await readImageBuffer(imagePath);
-    if (!raw) return null;
+    return enqueueImageJob(async () => {
+        // 客户端已经不等了（划过去了 / 换章节了）→ 直接放弃，别继续占队列
+        if (isAborted()) return null;
 
-    const jpeg = shrinkToJpeg(raw.buffer, width);
-    if (jpeg) {
-        try { fs.writeFileSync(cacheFile, jpeg); } catch { /* ignore */ }
-        return { buffer: jpeg, mime: 'image/jpeg' };
+        // 排队期间可能已经被别的请求生成好了
+        if (fs.existsSync(cacheFile)) {
+            try { return { buffer: fs.readFileSync(cacheFile), mime: 'image/jpeg' }; } catch { /* ignore */ }
+        }
+
+        if (isAborted()) return null;
+        const jpeg = await makeThumbJpeg(imagePath, width);
+        if (jpeg) {
+            try { fs.writeFileSync(cacheFile, jpeg); } catch { /* ignore */ }
+            return { buffer: jpeg, mime: 'image/jpeg' };
+        }
+
+        // 兜底：gif/webp/bmp 或 nativeImage 不支持时，直接用原图
+        const raw = await readImageBuffer(imagePath);
+        if (!raw) return null;
+        return { buffer: raw.buffer, mime: imageMime(raw.ext) };
+    }, lowPriority);
+}
+
+/**
+ * 生成缩略图 jpeg
+ * - 普通文件（文件夹漫画）：用系统的异步缩略图接口，不在主进程里解码，最快
+ * - 压缩包内图片（cbz / mobi / epub）：只能取出字节再解码
+ */
+async function makeThumbJpeg(imagePath, width) {
+    const isPseudo = imagePath.startsWith('cbz::') || imagePath.startsWith('mobi::') || imagePath.startsWith('epub::');
+    if (!isPseudo) {
+        try {
+            const img = await nativeImage.createThumbnailFromPath(imagePath, {
+                width,
+                height: Math.round(width * 4 / 3),
+            });
+            if (img && !img.isEmpty()) {
+                const jpeg = img.toJPEG(78);
+                if (jpeg && jpeg.length) return jpeg;
+            }
+        } catch { /* 失败就走下面的兜底 */ }
     }
 
-    // 兜底：gif/webp/bmp 或 nativeImage 不支持时，直接用原图
-    return { buffer: raw.buffer, mime: imageMime(raw.ext) };
+    const raw = await readImageBuffer(imagePath);
+    if (!raw) return null;
+    return shrinkToJpeg(raw.buffer, width);
 }
+
+// ⭐ 把早期缓存下来的"原图级"封面缩成 640px（一次性，之后一直是小的）
+const MAX_COVER_BYTES = 220 * 1024;
+async function shrinkCoverFileIfNeeded(file) {
+    try {
+        const st = fs.statSync(file);
+        if (st.size <= MAX_COVER_BYTES) return file;
+
+        const jpeg = await enqueueImageJob(async () => {
+            const buf = fs.readFileSync(file);
+            const out = shrinkToJpeg(buf, 640, 82);
+            return (out && out.length > 0 && out.length < st.size) ? out : null;
+        });
+        if (!jpeg) return file;   // webp 之类缩不了的，就保持原样
+
+        const target = file.replace(/\.[^.\\/]+$/, '') + '.jpg';
+        fs.writeFileSync(target, jpeg);
+        if (target !== file) {
+            try { fs.unlinkSync(file); } catch { /* ignore */ }
+        }
+        console.log('[封面] 旧大图已缩小:', path.basename(file), '→', Math.round(jpeg.length / 1024) + 'KB');
+        return target;
+    } catch (e) {
+        return file;
+    }
+}
+
+// ⭐ 后台预热整话缩略图（低优先级：只有用户没在等图的时候才做）
+let warmToken = 0;
+ipcMain.handle('warm-thumbnails', async (_event, chapterId, maxWidth = 320) => {
+    try {
+        const token = ++warmToken;
+        const db = getDB();
+        const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(chapterId);
+        if (!chapter) return { success: false, error: '章节不存在' };
+
+        const images = listChapterImages(chapter);
+        if (images.length === 0) return { success: true, total: 0 };
+
+        // 不 await：让它在后台慢慢排队
+        (async () => {
+            for (const img of images) {
+                if (token !== warmToken) return;      // 用户已经换章节了
+                try {
+                    await getThumbnailBuffer(img.path, maxWidth, { lowPriority: true });
+                } catch { /* ignore */ }
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            console.log('[预热] 缩略图完成:', images.length, '张');
+        })();
+
+        return { success: true, total: images.length };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+});
 
 /**
  * manga://img/<encodeURIComponent(图片路径)>       → 原图
@@ -364,7 +592,7 @@ async function handleMangaRequest(request) {
         if (kind === 'cover') {
             const seriesId = parseInt(parts[0], 10);
             const mode = parts[1] === 'static' ? 'static' : 'dynamic';
-            const cover = buildCover(seriesId, mode);
+            const cover = await buildCover(seriesId, mode);
             if (!cover) return new Response(null, { status: 404 });
             if (cover.file) {
                 const ext = path.extname(cover.file).slice(1).toLowerCase() || 'jpg';
@@ -383,7 +611,10 @@ async function handleMangaRequest(request) {
         if (kind === 'thumb') {
             const width = parseInt(parts.shift(), 10) || 320;
             imagePath = decodeURIComponent(parts.join('/'));
-            const got = await getThumbnailBuffer(imagePath, width);
+            // 浏览器如果已经放弃这个请求（图被划走了），队列里就直接跳过
+            const got = await getThumbnailBuffer(imagePath, width, {
+                isAborted: () => !!(request.signal && request.signal.aborted),
+            });
             if (!got) return new Response(null, { status: 404 });
             return new Response(got.buffer, {
                 status: 200,
@@ -529,9 +760,23 @@ ipcMain.handle('import-files', async (event, filePaths) => {
         const list = Array.isArray(filePaths) ? filePaths : [filePaths];
         const items = [];
         for (let i = 0; i < list.length; i++) {
-            send('scan', { current: i + 1, total: list.length, name: path.basename(list[i]) });
-            const item = buildItemFromFile(list[i]);
-            if (item) items.push(item);
+            const p = list[i];
+            send('scan', { current: i + 1, total: list.length, name: path.basename(p) });
+
+            let isDir = false;
+            try { isDir = fs.statSync(p).isDirectory(); } catch { /* ignore */ }
+
+            if (isDir) {
+                // ⭐ 拖进来的是文件夹 → 按「导入文件夹」的方式扫一遍
+                const sub = await scanDirectory(p, (pr) => send('scan', {
+                    current: i + 1, total: list.length,
+                    name: `${path.basename(p)}/${pr.name}`,
+                }));
+                for (const it of sub) items.push(it);
+            } else {
+                const item = buildItemFromFile(p);
+                if (item) items.push(item);
+            }
             await new Promise(resolve => setImmediate(resolve));
         }
         if (items.length === 0) {
@@ -550,6 +795,10 @@ ipcMain.handle('list-series', () => {
     return db.prepare(`
         SELECT s.*,
                (SELECT COUNT(*) FROM chapters WHERE series_id = s.id) AS chapter_count,
+               (SELECT COALESCE(SUM(page_count), 0) FROM chapters WHERE series_id = s.id) AS page_count,
+               (SELECT COALESCE(SUM(reading_seconds), 0) FROM chapters WHERE series_id = s.id) AS reading_seconds,
+               (SELECT MAX(COALESCE(last_read_at, created_at)) FROM chapters
+                 WHERE series_id = s.id AND (last_read_page > 0 OR last_read_at IS NOT NULL)) AS last_read_at,
                (SELECT id FROM chapters WHERE series_id = s.id ORDER BY chapter_number LIMIT 1) AS first_chapter_id,
       (SELECT id FROM chapters WHERE series_id = s.id AND last_read_page > 0
         ORDER BY created_at DESC LIMIT 1) AS last_read_chapter_id
@@ -566,8 +815,8 @@ ipcMain.handle('list-chapters', (_event, seriesId) => {
   `).all(seriesId);
 });
 
-ipcMain.handle('get-series-cover', (_event, seriesId, mode = 'dynamic') => {
-    const cover = buildCover(seriesId, mode);
+ipcMain.handle('get-series-cover', async (_event, seriesId, mode = 'dynamic') => {
+    const cover = await buildCover(seriesId, mode);
     if (!cover) return null;
     if (cover.file) {
         try { return fileToDataUrl(cover.file); } catch { /* ignore */ }
@@ -579,7 +828,7 @@ ipcMain.handle('get-series-cover', (_event, seriesId, mode = 'dynamic') => {
  * 生成/读取某个系列的封面（带缓存），给 IPC 和 manga:// 协议共用
  * 返回 { file } 或 { buffer, mime } 或 null
  */
-function buildCover(seriesId, mode = 'dynamic') {
+async function buildCover(seriesId, mode = 'dynamic') {
     const db = getDB();
 
     // 先决定用哪一章当封面：动态模式优先「最近在读」，否则第一卷
@@ -603,13 +852,18 @@ function buildCover(seriesId, mode = 'dynamic') {
     // 只有换了「正在读的那一卷」才会重新生成
     const cacheKey = mode === 'dynamic' ? `${seriesId}_c${chapter.id}` : `${seriesId}`;
     const cached = findCoverCache(cacheKey);
-    if (cached) return { file: cached };
+    if (cached) {
+        // 老缓存里可能是原图（几百 KB ~ 几 MB），顺手缩一下 —— 不然漫画库滚动会非常卡
+        const fixed = await shrinkCoverFileIfNeeded(cached);
+        return { file: fixed };
+    }
 
     const raw = getChapterCoverRaw(chapter);
     if (!raw) return null;
 
     // 封面上卡片只显示 200px 左右，缓存里存缩小版即可（原来是原图，一张几百 KB）
-    const shrunk = shrinkToJpeg(raw.buffer, 640, 82);
+    // 和缩略图共用队列，避免一次生成几十张封面时把主进程堵住
+    const shrunk = await enqueueImageJob(async () => shrinkToJpeg(raw.buffer, 640, 82));
     const coverBuffer = shrunk || raw.buffer;
     const coverExt = shrunk ? 'jpg' : raw.ext;
 
@@ -639,8 +893,74 @@ ipcMain.handle('list-chapter-images', async (_event, chapterId) => {
     return listChapterImages(chapter);
 });
 
+// ⭐ 每页宽高：前端用来判断"这页是不是躺倒的跨页"
+ipcMain.handle('get-chapter-image-sizes', async (_event, chapterId) => {
+    const db = getDB();
+    const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(chapterId);
+    if (!chapter) return null;
+    return getChapterImageSizes(chapter);
+});
+
 // 原图：epub / cbz / mobi / 散图都由 readImageBuffer 统一处理
 ipcMain.handle('get-image', async (_event, imagePath) => getImageAsDataUrl(imagePath));
+
+// ⭐ 右键菜单：返回被点中的那一项的 id（没选就返回 null）
+ipcMain.handle('context-menu', (event, items) => {
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (id) => {
+            if (done) return;
+            done = true;
+            resolve(id);
+        };
+
+        const template = (items || []).map((item) => {
+            if (!item || item.separator) return { type: 'separator' };
+            return {
+                label: String(item.label || ''),
+                enabled: item.enabled !== false,
+                click: () => finish(item.id),
+            };
+        });
+        if (template.length === 0) return finish(null);
+
+        const menu = Menu.buildFromTemplate(template);
+        const win = (event && event.sender) ? BrowserWindow.fromWebContents(event.sender) : null;
+        menu.popup({ window: win || undefined, callback: () => finish(null) });
+    });
+});
+
+// ⭐ 在资源管理器里定位文件（文件→选中它；文件夹→打开它）
+ipcMain.handle('reveal-path', async (_event, target) => {
+    try {
+        if (!target || typeof target !== 'string') return { success: false, error: '没有路径' };
+        const st = fs.statSync(target);
+        if (st.isDirectory()) {
+            const err = await shell.openPath(target);
+            return err ? { success: false, error: err } : { success: true };
+        }
+        shell.showItemInFolder(target);
+        return { success: true };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+});
+
+// ⭐ 复制文本到剪贴板
+ipcMain.handle('copy-text', (_event, text) => {
+    try {
+        clipboard.writeText(String(text == null ? '' : text));
+        return { success: true };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+});
+
+// ⭐ 取单条章节记录（右键菜单需要它的 file_path）
+ipcMain.handle('get-chapter', (_event, chapterId) => {
+    const db = getDB();
+    return db.prepare('SELECT * FROM chapters WHERE id = ?').get(chapterId) || null;
+});
 
 ipcMain.handle('update-progress', (_event, chapterId, page) => {
     const db = getDB();
@@ -650,6 +970,23 @@ ipcMain.handle('update-progress', (_event, chapterId, page) => {
         WHERE id = ?
     `).run(page, page > 0 ? 1 : 0, chapterId);
     return { success: true };
+});
+
+// ⭐ 累计阅读时长（秒），阅读器每隔一段时间上报一次
+ipcMain.handle('add-reading-time', (_event, chapterId, seconds) => {
+    try {
+        const s = Math.max(0, Math.round(Number(seconds) || 0));
+        if (!s) return { success: true, added: 0 };
+        const db = getDB();
+        db.prepare(`
+            UPDATE chapters
+            SET reading_seconds = COALESCE(reading_seconds, 0) + ?
+            WHERE id = ?
+        `).run(s, chapterId);
+        return { success: true, added: s };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
 });
 
 ipcMain.handle('recent-reading', () => {
@@ -681,12 +1018,28 @@ ipcMain.handle('search-series', (_event, keyword, tagId) => {
     const kw = (keyword || '').trim().toLowerCase();
     const all = db.prepare('SELECT * FROM series ORDER BY title').all();
 
-    // 章节数一次查完，避免每条 series 再单独查一次
-    const counts = new Map(
-        db.prepare('SELECT series_id, COUNT(*) AS c FROM chapters GROUP BY series_id').all()
-            .map(r => [r.series_id, r.c])
+    // 章节数 / 总页数一次查完，避免每条 series 再单独查一次
+    const stats = new Map(
+        db.prepare(`
+      SELECT series_id,
+             COUNT(*) AS c,
+             COALESCE(SUM(page_count), 0) AS p,
+             COALESCE(SUM(reading_seconds), 0) AS sec,
+             MAX(CASE WHEN last_read_page > 0 OR last_read_at IS NOT NULL
+                      THEN COALESCE(last_read_at, created_at) END) AS last
+      FROM chapters GROUP BY series_id
+    `).all().map(r => [r.series_id, r])
     );
-    const withCount = (s) => ({ ...s, chapter_count: counts.get(s.id) || 0 });
+    const withCount = (s) => {
+        const st = stats.get(s.id);
+        return {
+            ...s,
+            chapter_count: st ? st.c : 0,
+            page_count: st ? st.p : 0,
+            reading_seconds: st ? st.sec : 0,
+            last_read_at: st ? st.last : null,
+        };
+    };
 
     // ⭐ 按标签筛选
     let base = all;

@@ -6,7 +6,7 @@ import ProgressBar from '../components/ProgressBar';
 type Props = {
     seriesId: number;
     seriesTitle: string;
-    onOpenImageWall: (chapterId: number, chapterTitle: string) => void;
+    onOpenImageWall: (chapterId: number, chapterTitle: string, chapterCount: number) => void;
     onTagsChanged?: () => void;
 };
 
@@ -50,7 +50,7 @@ export default function SeriesDetail({ seriesId, seriesTitle, onOpenImageWall, o
                 return (
                     <div
                         key={ch.id}
-                        onClick={() => onOpenImageWall(ch.id, ch.title)}
+                        onClick={() => onOpenImageWall(ch.id, ch.title, chapters.length)}
                         style={{
                             display: 'flex',
                             alignItems: 'center',

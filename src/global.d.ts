@@ -40,6 +40,14 @@ export type MangaApi = {
     importFiles: (filePaths: string[]) => Promise<ImportResult>;
     // 导入进度推送（返回取消订阅函数）
     onImportProgress: (cb: (p: ImportProgress) => void) => () => void;
+    // 拖入文件 → 路径
+    getPathForFile: (file: File) => string;
+    // 右键菜单：传入 [{ id, label } | { separator: true }]，返回被点中的 id
+    contextMenu: (items: ({ id: string; label: string; enabled?: boolean } | { separator: true })[]) => Promise<string | null>;
+    revealPath: (target: string) => Promise<{ success: boolean; error?: string }>;
+    copyText: (text: string) => Promise<{ success: boolean; error?: string }>;
+    getChapter: (chapterId: number) => Promise<Chapter | null>;
+    warmThumbnails: (chapterId: number, maxWidth?: number) => Promise<{ success: boolean; total?: number; error?: string }>;
     // 漫画库
     listSeries: () => Promise<Series[]>;
     searchSeries: (keyword: string, tagId?: number | null) => Promise<Series[]>;
@@ -54,6 +62,7 @@ export type MangaApi = {
     imageUrl: (imagePath: string, maxWidth?: number) => string;
     coverUrl: (seriesId: number, mode?: 'dynamic' | 'static') => string;
     updateProgress: (chapterId: number, page: number) => Promise<{ success: boolean }>;
+    addReadingTime: (chapterId: number, seconds: number) => Promise<{ success: boolean; added?: number }>;
     recentReading: () => Promise<RecentItem[]>;
     // 收藏
     toggleFavoriteSeries: (seriesId: number) => Promise<{ success: boolean; is_favorite?: number }>;

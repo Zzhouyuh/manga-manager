@@ -13,6 +13,11 @@ type Props = {
     activeTagId: number | null;
     onSelectTag: (tag: Tag | null) => void;
     onDeleteTag: (tag: Tag) => void;
+    // ⭐ 抽屉式侧边栏：默认收起，鼠标移入滑出
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+    // true = 阅读器/图片墙里才用抽屉模式（平时侧边栏常驻）
+    drawer: boolean;
 };
 
 const NAV_ITEMS: { key: PageKey; label: string; icon: string }[] = [
@@ -25,6 +30,7 @@ const NAV_ITEMS: { key: PageKey; label: string; icon: string }[] = [
 export default function Sidebar({
                                     current, onNavigate, searchKeyword, onSearch,
                                     tags, activeTagId, onSelectTag, onDeleteTag,
+                                    open, onOpenChange, drawer,
                                 }: Props) {
     const [local, setLocal] = useState(searchKeyword);
 
@@ -35,14 +41,28 @@ export default function Sidebar({
 
     return (
         <aside
+            onMouseEnter={() => { if (drawer) onOpenChange(true); }}
+            onMouseLeave={() => { if (drawer) onOpenChange(false); }}
             style={{
+                ...(drawer
+                    ? {
+                        position: 'absolute' as const,
+                        left: 0,
+                        top: 0,
+                        bottom: 0,
+                        zIndex: 30,
+                        transform: open ? 'translateX(0)' : 'translateX(-100%)',
+                        transition: 'transform 0.18s ease',
+                        boxShadow: open ? '6px 0 18px rgba(0,0,0,0.35)' : 'none',
+                    }
+                    : { flexShrink: 0 }),
                 width: 220,
                 height: '100%',
+                zIndex: 30,
                 background: 'var(--bg-secondary)',
                 borderRight: '1px solid var(--border)',
                 display: 'flex',
                 flexDirection: 'column',
-                flexShrink: 0,
             }}
         >
             {/* Logo */}
@@ -84,7 +104,10 @@ export default function Sidebar({
                     return (
                         <button
                             key={item.key}
-                            onClick={() => onNavigate(item.key)}
+                            onClick={() => {
+                                onNavigate(item.key);
+                                onOpenChange(false);   // 点完就收起抽屉
+                            }}
                             style={{
                                 display: 'flex',
                                 alignItems: 'center',
@@ -153,7 +176,10 @@ export default function Sidebar({
                         return (
                             <div
                                 key={t.id}
-                                onClick={() => onSelectTag(active ? null : t)}
+                                onClick={() => {
+                                    onSelectTag(active ? null : t);
+                                    onOpenChange(false);
+                                }}
                                 title={`${t.name}（${t.series_count ?? 0} 本）`}
                                 style={{
                                     display: 'flex',

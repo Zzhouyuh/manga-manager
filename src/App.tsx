@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Sidebar, { PageKey } from './components/Sidebar';
 import Home from './pages/Home';
 import Library from './pages/Library';
@@ -9,7 +9,7 @@ import Favorites from './pages/Favorites';
 import Settings from './pages/Settings';
 import { applyTheme } from './themes';
 import ProgressBar from './components/ProgressBar';
-import type { Route, Series, Tag, ThemeName } from './types';
+import type { Route, RouteOrigin, Series, Tag, ThemeName } from './types';
 
 // ⭐ 导入进度弹窗状态
 type ImportUiState = {
@@ -28,6 +28,22 @@ export default function App() {
     const [tags, setTags] = useState<Tag[]>([]);
     const [activeTag, setActiveTag] = useState<Tag | null>(null);
     const [importUi, setImportUi] = useState<ImportUiState>(null);
+    // ⭐ 抽屉式侧边栏（默认收起，鼠标移到左边缘滑出）
+    const [sidebarOpen, setSidebarOpen] = useState(false);
+    const sidebarCloseTimer = useRef<number | null>(null);
+
+    const openSidebar = () => {
+        if (sidebarCloseTimer.current) {
+            window.clearTimeout(sidebarCloseTimer.current);
+            sidebarCloseTimer.current = null;
+        }
+        setSidebarOpen(true);
+    };
+
+    const closeSidebar = () => {
+        if (sidebarCloseTimer.current) window.clearTimeout(sidebarCloseTimer.current);
+        sidebarCloseTimer.current = window.setTimeout(() => setSidebarOpen(false), 280);
+    };
     const [coverMode, setCoverMode] = useState<'dynamic' | 'static'>(() => {
         return (localStorage.getItem('coverMode') as any) || 'dynamic';
     });
@@ -96,11 +112,14 @@ export default function App() {
         chapterId: number, chapterTitle: string,
         seriesId: number, seriesTitle: string, startPage: number
     ) => {
+        // 从首页 / 收藏页直接进阅读器 → 返回时就回到那里
+        const from: RouteOrigin = route.name === 'favorites' ? 'favorites' : 'home';
         setRoute({
             name: 'reader',
             chapterId, chapterTitle,
             seriesId, seriesTitle,
             startPage: startPage > 0 ? startPage - 1 : 0,
+            from,
         });
     };
 
@@ -124,14 +143,15 @@ export default function App() {
         });
     };
 
-    const handleOpenImageWall = (chapterId: number, chapterTitle: string) => {
+    const handleOpenImageWall = (chapterId: number, chapterTitle: string, chapterCount = 0) => {
         if (route.name !== 'seriesDetail') return;
         setRoute({
             name: 'imageWall',
             chapterId, chapterTitle,
             seriesId: route.seriesId,
             seriesTitle: route.seriesTitle,
-            isSingleChapter: false,
+            // 只有一话的漫画没必要再退回"卷目录"，直接回漫画库
+            isSingleChapter: chapterCount === 1,
         });
     };
 
@@ -144,6 +164,8 @@ export default function App() {
             seriesId: route.seriesId,
             seriesTitle: route.seriesTitle,
             startPage,
+            from: 'imageWall',
+            wallSingle: route.isSingleChapter,
         });
     };
 
@@ -156,6 +178,8 @@ export default function App() {
             seriesId: route.seriesId,
             seriesTitle: route.seriesTitle,
             startPage: 0,
+            from: route.from,      // 换话不改变"从哪进来"的记忆
+            wallSingle: route.wallSingle,
         });
     };
 
@@ -174,19 +198,37 @@ export default function App() {
     };
 
     const handleBack = (currentPage?: number) => {
-        if (route.name === 'reader' && route.seriesId) {
+        // ⭐ 阅读器：从哪里进来的就回到哪里
+        if (route.name === 'reader') {
             if (typeof currentPage === 'number') {
                 setWallScrollTarget({ chapterId: route.chapterId, pageIndex: currentPage });
             }
-            setRoute({
-                name: 'imageWall',
-                chapterId: route.chapterId,
-                chapterTitle: route.chapterTitle,
-                seriesId: route.seriesId,
-                seriesTitle: route.seriesTitle,
-                isSingleChapter: false,
-            });
-        } else if (route.name === 'imageWall') {
+            if (route.from === 'imageWall') {
+                setRoute({
+                    name: 'imageWall',
+                    chapterId: route.chapterId,
+                    chapterTitle: route.chapterTitle,
+                    seriesId: route.seriesId,
+                    seriesTitle: route.seriesTitle,
+                    isSingleChapter: !!route.wallSingle,
+                });
+            } else if (route.from === 'seriesDetail') {
+                setRoute({
+                    name: 'seriesDetail',
+                    seriesId: route.seriesId,
+                    seriesTitle: route.seriesTitle,
+                });
+            } else if (route.from === 'favorites') {
+                setRoute({ name: 'favorites' });
+            } else if (route.from === 'library') {
+                setRoute({ name: 'library' });
+            } else {
+                setRoute({ name: 'home' });
+            }
+            return;
+        }
+
+        if (route.name === 'imageWall') {
             setWallScrollTarget(null);
             if (route.isSingleChapter) {
                 setRoute({ name: 'library' });
@@ -197,11 +239,15 @@ export default function App() {
                     seriesTitle: route.seriesTitle,
                 });
             }
-        } else if (route.name === 'seriesDetail') {
-            setRoute({ name: 'library' });
-        } else {
-            setRoute({ name: 'home' });
+            return;
         }
+
+        if (route.name === 'seriesDetail') {
+            setRoute({ name: 'library' });
+            return;
+        }
+
+        setRoute({ name: 'home' });
     };
 
     // 刷新漫画库：切到首页再切回，触发重新加载
@@ -214,12 +260,9 @@ export default function App() {
         }
     };
 
-    // ⭐ 导入（带进度弹窗）
-    const runImport = async (kind: 'folder' | 'files') => {
+    // ⭐ 真正执行导入（弹进度窗 + 结束刷新）
+    const executeImport = async (kind: 'folder' | 'files', target: any) => {
         const api = (window as any).api;
-        const target = kind === 'folder' ? await api.pickDirectory() : await api.pickFiles();
-        if (!target || (Array.isArray(target) && target.length === 0)) return;
-
         setImportUi({ running: true, phase: 'scan', current: 0, total: 0, name: '', result: null });
         try {
             const result = kind === 'folder'
@@ -233,6 +276,55 @@ export default function App() {
                 result: { success: false, error: (e && e.message) || String(e) },
             });
         }
+    };
+
+    // ⭐ 选文件夹 / 选文件导入
+    const runImport = async (kind: 'folder' | 'files') => {
+        const api = (window as any).api;
+        const target = kind === 'folder' ? await api.pickDirectory() : await api.pickFiles();
+        if (!target || (Array.isArray(target) && target.length === 0)) return;
+        await executeImport(kind, target);
+    };
+
+    // ⭐ 拖入文件/文件夹导入
+    const dragCounter = useRef(0);
+    const [dragOver, setDragOver] = useState(false);
+
+    const handleDragEnter = (e: React.DragEvent) => {
+        if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes('Files')) return;
+        dragCounter.current += 1;
+        setDragOver(true);
+    };
+
+    const handleDragOver = (e: React.DragEvent) => {
+        if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes('Files')) return;
+        e.preventDefault();                     // 不 preventDefault 就不会触发 drop
+        e.dataTransfer.dropEffect = 'copy';
+    };
+
+    const handleDragLeave = () => {
+        dragCounter.current = Math.max(0, dragCounter.current - 1);
+        if (dragCounter.current === 0) setDragOver(false);
+    };
+
+    const handleDrop = async (e: React.DragEvent) => {
+        e.preventDefault();
+        dragCounter.current = 0;
+        setDragOver(false);
+        const files = e.dataTransfer ? Array.from(e.dataTransfer.files) : [];
+        if (files.length === 0) return;
+
+        const api = (window as any).api;
+        const paths: string[] = [];
+        for (const f of files) {
+            const p = api.getPathForFile ? api.getPathForFile(f) : '';
+            if (p) paths.push(p);
+        }
+        if (paths.length === 0) {
+            alert('没能取到这些文件的真实路径。\n\n如果你是从压缩软件或浏览器里直接拖出来的临时文件，请先解压到文件夹再拖进来。');
+            return;
+        }
+        await executeImport('files', paths);
     };
 
     const handleImport = () => runImport('folder');
@@ -337,7 +429,70 @@ export default function App() {
     const fullscreen = route.name === 'reader' || route.name === 'imageWall';
 
     return (
-        <div style={{ display: 'flex', width: '100vw', height: '100vh' }}>
+        <div
+            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            style={{ position: 'relative', display: 'flex', width: '100vw', height: '100vh', overflow: 'hidden' }}
+        >
+            {/* ⭐ 拖入提示 */}
+            {dragOver && (
+                <div
+                    style={{
+                        position: 'fixed',
+                        inset: 0,
+                        zIndex: 300,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        background: 'rgba(0,0,0,0.5)',
+                        pointerEvents: 'none',
+                    }}
+                >
+                    <div
+                        style={{
+                            padding: '26px 40px',
+                            border: '2px dashed var(--primary)',
+                            borderRadius: 14,
+                            background: 'rgba(0,0,0,0.45)',
+                            color: 'white',
+                            fontSize: 16,
+                            fontWeight: 600,
+                        }}
+                    >
+                        📥 松开鼠标导入漫画文件 / 文件夹
+                    </div>
+                </div>
+            )}
+            {/* ⭐ 左边缘热区 + 抽屉把手：鼠标移过去滑出侧边栏
+                （只在阅读器 / 图片墙里才用抽屉，平时侧边栏常驻） */}
+            {fullscreen && (
+                <div
+                    onMouseEnter={openSidebar}
+                    style={{
+                        position: 'absolute',
+                        left: 0, top: 0, bottom: 0,
+                        width: 8,
+                        zIndex: 25,
+                        display: 'flex',
+                        alignItems: 'center',
+                    }}
+                >
+                    {!sidebarOpen && (
+                        <div
+                            style={{
+                                width: 3,
+                                height: 44,
+                                marginLeft: 2,
+                                borderRadius: 3,
+                                background: 'rgba(255,255,255,0.35)',
+                            }}
+                        />
+                    )}
+                </div>
+            )}
+
             <Sidebar
                 current={currentNav}
                 onNavigate={handleNavigate}
@@ -352,6 +507,9 @@ export default function App() {
                 activeTagId={activeTag ? activeTag.id : null}
                 onSelectTag={handleSelectTag}
                 onDeleteTag={handleDeleteTag}
+                open={sidebarOpen}
+                onOpenChange={willOpen => (willOpen ? openSidebar() : closeSidebar())}
+                drawer={fullscreen}
             />
 
             <main
